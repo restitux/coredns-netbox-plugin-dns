@@ -15,7 +15,7 @@ type APIRequestClient struct {
 }
 
 type APIResultModel interface {
-	Record | Zone
+	Record | Zone | View
 }
 
 type APIManyResponse[T APIResultModel] struct {

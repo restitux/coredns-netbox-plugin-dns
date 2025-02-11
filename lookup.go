@@ -1,8 +1,11 @@
 package netboxdns
 
 import (
+	"fmt"
+	"net/netip"
 	"strings"
 
+	"github.com/coredns/coredns/plugin/pkg/log"
 	"github.com/doubleu-labs/coredns-netbox-plugin-dns/internal/netbox"
 	"github.com/miekg/dns"
 )
@@ -24,88 +27,138 @@ type lookupResponse struct {
 
 func (netboxdns *NetboxDNS) lookup(
 	name string,
+	reqIP netip.Addr,
 	qtype uint16,
 	family int,
 ) (*lookupResponse, error) {
+	logger.Debugf("request for [%v] %v from %v\n", dns.TypeToString[qtype], name, reqIP)
+
 	nameTrimmed := strings.TrimSuffix(name, ".")
 	// check if zone exists on Netbox
-	zone, err := netboxdns.matchZone(nameTrimmed)
+	zones, default_zone_index, err := netboxdns.matchZone(nameTrimmed, reqIP)
 	if err != nil {
 		return nil, err
 	}
-	if zone == nil {
+	if zones == nil {
 		logger.Debugf("no zone matching %q", name)
 		return &lookupResponse{LookupResult: lookupNameError}, nil
 	}
 
-	// check if qname is for zone origin
-	if nameTrimmed == zone.Name {
-		originResponse, err := netboxdns.processOrigin(qtype, zone, family)
-		if err != nil {
-			return nil, err
+	// var responses []*lookupResponse
+	var defaultResponse *lookupResponse
+	for i, zone := range zones {
+		is_zone_default := i == default_zone_index
+		// check if qname is for zone origin
+		if nameTrimmed == zone.Name {
+			originResponse, err := netboxdns.processOrigin(qtype, zone)
+			if err != nil {
+				log.Debugf("Could not process origin for zone %v: %w", zone, err)
+				continue
+			}
+			if originResponse != nil {
+				logger.Debugf(
+					"found origin records for [%s] %q in zone %v",
+					dns.TypeToString[qtype],
+					name,
+					zone.Name,
+				)
+				if is_zone_default {
+					return originResponse, nil
+				} else {
+					defaultResponse = originResponse
+				}
+				continue
+			}
 		}
-		if originResponse != nil {
+
+		// lookup exact request
+		direct, err := netboxdns.lookupDirect(nameTrimmed, qtype, zone)
+		if err != nil {
+			log.Debugf("could not lookup exact request for %v in zone %v: %w", nameTrimmed, zone.Name, err)
+			continue
+		}
+		if direct != nil {
 			logger.Debugf(
-				"found origin records for [%s] %q",
+				"found records for [%s] %q in zone %v",
 				dns.TypeToString[qtype],
 				name,
+				zone.View.Name,
 			)
-			return originResponse, nil
+			if is_zone_default {
+				return direct, nil
+			} else {
+				defaultResponse = direct
+			}
+			continue
+		}
+
+		// if no exact records exist for the request, check if the qname is a
+		// delegate zone
+		delegate, err := netboxdns.lookupDelegate(nameTrimmed, zone, qtype)
+		if err != nil {
+			log.Debugf("could not lookup delegate for %v in zone %v: %w", nameTrimmed, zone.Name, err)
+			continue
+		}
+		if delegate != nil {
+			logger.Debugf("found delegate zone records for %q in zone %v", name, zone.Name)
+			// return delegate, nil
+			if is_zone_default {
+				return delegate, nil
+			} else {
+				defaultResponse = delegate
+			}
+
+			continue
 		}
 	}
-
-	// lookup exact request
-	direct, err := netboxdns.lookupDirect(nameTrimmed, qtype, zone, family)
-	if err != nil {
-		return nil, err
+	if defaultResponse != nil {
+		return defaultResponse, nil
+	} else {
+		log.Errorf("could not resolve any records for request %v", nameTrimmed)
+		return nil, fmt.Errorf("could not resolve any records for request %v ", nameTrimmed)
 	}
-	if direct != nil {
-		logger.Debugf(
-			"found records for [%s] %q",
-			dns.TypeToString[qtype],
-			name,
-		)
-		return direct, nil
-	}
-
-	// if no exact records exist for the request, check if the qname is a
-	// delegate zone
-	delegate, err := netboxdns.lookupDelegate(nameTrimmed, zone, family)
-	if err != nil {
-		return nil, err
-	}
-	if delegate != nil {
-		logger.Debugf("found delegate zone records for %q", name)
-		return delegate, nil
-	}
-
-	logger.Debugf("no records found for [%s] %q", dns.TypeToString[qtype], name)
-	return &lookupResponse{LookupResult: lookupNameError}, nil
 }
 
-func (netboxdns *NetboxDNS) matchZone(qname string) (*netbox.Zone, error) {
+func (netboxdns *NetboxDNS) matchZone(qname string, reqIP netip.Addr) ([]*netbox.Zone, int, error) {
 	managedZones, err := netbox.GetZones(netboxdns.requestClient)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var out *netbox.Zone
+	var out []*netbox.Zone
+	index_of_default := -1
 	for _, managedZone := range managedZones {
+		view, err := netbox.GetView(netboxdns.requestClient, managedZone.View.ID)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		viewContainsIP, err := view.ContainsIP(reqIP)
+		if err != nil {
+			return nil, 0, err
+		}
+		if !viewContainsIP {
+			log.Debugf("view %v's configured prefixes don't match request IP %v", view.Name, reqIP.String())
+			continue
+		}
+		log.Debugf("view %v's configured prefixes match request IP %v", view.Name, reqIP.String())
+
 		if dns.IsSubDomain(managedZone.Name, qname) {
-			if out == nil {
-				out = &managedZone
-			}
-			if len(managedZone.Name) > len(out.Name) {
-				out = &managedZone
+			out = append(out, &managedZone)
+			if view.Default {
+				if index_of_default != -1 {
+					log.Errorf("more than one default view configured for IP %v", reqIP.String())
+					return nil, 0, fmt.Errorf("more than one default view configured for IP %v", reqIP.String())
+				}
+				index_of_default = len(out)
 			}
 		}
 	}
-	return out, nil
+	return out, index_of_default, nil
 }
 
 func (netboxdns *NetboxDNS) processOrigin(
 	qtype uint16,
 	zone *netbox.Zone,
-	family int,
 ) (*lookupResponse, error) {
 	var queryType []string
 	switch qtype {
@@ -133,14 +186,14 @@ func (netboxdns *NetboxDNS) processOrigin(
 	}
 	answer := filterRRByType(rrs, dns.TypeSOA)
 	ns := filterRRByType(rrs, dns.TypeNS)
-	extraRecords, err := netboxdns.processExtra(ns, zone, family)
+	extraRecords, err := netboxdns.processExtra(ns, zone, qtype)
 	if err != nil {
 		return nil, err
 	}
 	if len(extraRecords) == 0 {
 		// if no A/AAAA records exist for the NS in the specified zone, check if
 		// the server has records anywhere
-		extraRecords, err = netboxdns.processExtra(ns, nil, family)
+		extraRecords, err = netboxdns.processExtra(ns, nil, qtype)
 		if err != nil {
 			return nil, err
 		}
@@ -163,7 +216,7 @@ func (netboxdns *NetboxDNS) processOrigin(
 func (netboxdns *NetboxDNS) processExtra(
 	answer []dns.RR,
 	zone *netbox.Zone,
-	family int,
+	qtype uint16,
 ) ([]netbox.Record, error) {
 	var out []netbox.Record
 	for _, rr := range answer {
@@ -181,18 +234,18 @@ func (netboxdns *NetboxDNS) processExtra(
 		if len(name) == 0 {
 			continue
 		}
-		var reqType []string
-		switch family {
-		case 1:
-			reqType = []string{"A"}
-		case 2:
-			reqType = []string{"AAAA"}
-		}
+		//var reqType []string
+		//switch qtype {
+		//case 1:
+		//	reqType = []string{"A"}
+		//case 2:
+		//	reqType = []string{"AAAA"}
+		//}
 		records, err := netbox.GetRecordsQuery(
 			netboxdns.requestClient,
 			&netbox.RecordQuery{
 				FQDN: strings.TrimSuffix(name, "."),
-				Type: reqType,
+				Type: []string{dns.TypeToString[qtype]},
 				Zone: zone,
 			},
 		)
@@ -208,12 +261,12 @@ func (netboxdns *NetboxDNS) lookupDirect(
 	qname string,
 	qtype uint16,
 	zone *netbox.Zone,
-	family int,
 ) (*lookupResponse, error) {
 	queryTypes := []string{dns.TypeToString[qtype]}
 	if qtype == dns.TypeA || qtype == dns.TypeAAAA {
 		queryTypes = append(queryTypes, "CNAME")
 	}
+
 	records, err := netbox.GetRecordsQuery(
 		netboxdns.requestClient,
 		&netbox.RecordQuery{
@@ -225,37 +278,79 @@ func (netboxdns *NetboxDNS) lookupDirect(
 	if err != nil {
 		return nil, err
 	}
+	// log.Debugf("%v", records)
 
-	if len(records) > 0 {
-		answer, err := recordsToRR(records)
-		if err != nil {
-			return nil, err
+	// allRecords := append([]netbox.Record{}, records...)
+	var allRecords []netbox.Record
+
+	var newRecords []netbox.Record
+	for i := 0; ; i++ {
+		foundCNAME := false
+		// If record data end with ., pass as is
+		// If record data doesn't end with ., append the zone name
+		for i, record := range records {
+			// log.Debugf("%v", record)
+			if record.Type == "CNAME" {
+				foundCNAME = true
+				if record.Value[len(record.Value)-1:] != "." {
+					records[i].Value = strings.Join([]string{record.Value, ".", zone.Name, "."}, "")
+				}
+				// log.Debugf("%v", records[i].Value)
+				newRecordsForCNAME, err := netbox.GetRecordsQuery(
+					netboxdns.requestClient,
+					&netbox.RecordQuery{
+						FQDN: records[i].Value,
+						Type: queryTypes,
+						Zone: zone,
+					},
+				)
+				if err != nil {
+					return nil, err
+				}
+				// log.Debugf("%v", newRecordsForCNAME)
+
+				if len(newRecordsForCNAME) > 0 {
+					newRecords = append(newRecords, newRecordsForCNAME...)
+				}
+			}
 		}
-		extraRecords, err := netboxdns.processExtra(answer, zone, family)
-		if err != nil {
-			return nil, err
+		// log.Debugf("%v", newRecords)
+
+		allRecords = append(allRecords, records...)
+		records = newRecords
+		newRecords = []netbox.Record{}
+
+		if !foundCNAME {
+			break
 		}
-		extra, err := recordsToRR(extraRecords)
-		if err != nil {
-			return nil, err
+
+		if i > 20 {
+			return nil, fmt.Errorf("CNAME recursion depth exceeded")
 		}
-		cnames := filterRRByType(answer, dns.TypeCNAME)
-		if qtype == dns.TypeCNAME || len(cnames) > 0 {
-			answer = append(answer, extra...)
-			extra = nil
-		}
+	}
+	//for _, record := range allRecords {
+	//	log.Debugf("%v -> %v", record.FQDN, record.Value)
+	//}
+	answer, err := recordsToRR(allRecords)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug(answer)
+	if len(answer) > 0 {
 		return &lookupResponse{
 			Answer: answer,
-			Extra:  extra,
+			Extra:  []dns.RR{},
 		}, nil
+	} else {
+		return nil, nil
 	}
-	return nil, nil
 }
 
 func (netboxdns *NetboxDNS) lookupDelegate(
 	qname string,
 	zone *netbox.Zone,
-	family int,
+	qtype uint16,
 ) (*lookupResponse, error) {
 	records, err := netbox.GetRecordsQuery(
 		netboxdns.requestClient,
@@ -273,7 +368,7 @@ func (netboxdns *NetboxDNS) lookupDelegate(
 		if err != nil {
 			return nil, err
 		}
-		extraRecords, err := netboxdns.processExtra(ns, nil, family)
+		extraRecords, err := netboxdns.processExtra(ns, nil, qtype)
 		if err != nil {
 			return nil, err
 		}
