@@ -10,6 +10,10 @@ type Zone struct {
 	ID          int        `json:"id"`
 	Name        string     `json:"name"`
 	NameServers []SOAMName `json:"nameservers"`
+	View        struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+	}
 }
 
 type SOAMName struct {

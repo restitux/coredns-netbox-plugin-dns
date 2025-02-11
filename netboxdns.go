@@ -3,6 +3,7 @@ package netboxdns
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -57,6 +58,10 @@ func (netboxdns *NetboxDNS) ServeDNS(
 ) (int, error) {
 	state := request.Request{W: respWriter, Req: reqMsg}
 	qname := state.QName()
+	reqIP, err := netip.ParseAddr(state.IP())
+	if err != nil {
+		return dns.RcodeServerFailure, err
+	}
 	family := state.Family()
 	qtype := fixQType(state.QType(), family)
 
@@ -66,7 +71,7 @@ func (netboxdns *NetboxDNS) ServeDNS(
 		return netboxdns.nextOrFailure(reqContext, respWriter, reqMsg)
 	}
 
-	response, err := netboxdns.lookup(qname, qtype, family)
+	response, err := netboxdns.lookup(qname, reqIP, qtype, family)
 	if err != nil {
 		return dns.RcodeServerFailure, err
 	}
